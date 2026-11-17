@@ -15,7 +15,8 @@ Endpoints (Render free web service, $PORT):
   GET  /status?device_id=...    -> {status, code} / {status: "unknown"}
   POST /<telegram_token>        -> Telegram webhook
 
-Telegram commands (admin only, /start ပို့တဲ့ ပထမလူက admin):
+Telegram commands (admin only — ADMIN_ID env var သတ်မှတ်ထားရင် အဲ့ ID ပဲ
+အမြဲ admin; မသတ်မှတ်ထားရင် /start ပို့တဲ့ ပထမလူက admin):
   /start                        -> admin သတ်မှတ်ခြင်း + အကူအညီ
   /approve CODE                 -> device ကို approve (ဥပမာ /approve BEE-7K2Q9)
   /revoke CODE                  -> device ကို revoke (app ပြန်လော့ခ်သွားမယ်)
@@ -60,6 +61,12 @@ STORE_PATH = os.path.join(BASE_DIR, "licenses.json")
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 
+# Permanent admin: ADMIN_ID env var (Render Environment) — ကိုကြီးရဲ့
+# Telegram user ID ဂဏန်း။ သတ်မှတ်ထားရင် အဲ့ ID ပဲ အမြဲတမ်း admin —
+# restart / redeploy ဖြစ်လည်း မပြောင်းဘူး။ မသတ်မှတ်ထားရင် /start ပို့တဲ့
+# ပထမလူက admin (ဟောင်း ပုံစံ၊ licenses.json ထဲ သိမ်း)။
+ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
+
 # Device code အတွက် အက္ခရာများ — ရောထွေးလွယ်တာတွေ (0/O, 1/I/L) မပါဘူး
 _CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
@@ -73,6 +80,17 @@ def device_code(device_id):
     return "BEE-" + "".join(
         _CODE_ALPHABET[b % len(_CODE_ALPHABET)] for b in digest[:5]
     )
+
+
+def get_admin_id(store):
+    """Admin ရဲ့ Telegram user ID — ADMIN_ID env var (အမြဲ) ကို ဦးစားပေး၊
+    မရှိရင် licenses.json ထဲက သိမ်းထားတဲ့ admin_id ကို သုံး။"""
+    if ADMIN_ID:
+        try:
+            return int(ADMIN_ID)
+        except ValueError:
+            pass
+    return store.get("admin_id")
 
 
 def now_iso():
@@ -124,7 +142,7 @@ def _device_line(dev):
 async def notify_admin(app, device_id, dev):
     """Admin ဆီ approval တောင်းတဲ့ စာပို့ (admin မရှိသေးရင် ကျော်သွား)"""
     store = load_store()
-    admin_id = store.get("admin_id")
+    admin_id = get_admin_id(store)
     if not admin_id:
         log.info("Admin မရှိသေးဘူး — %s အတွက် notify မပို့ဘူး", dev["code"])
         return
@@ -159,10 +177,11 @@ async def notify_admin(app, device_id, dev):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store = load_store()
     user = update.effective_user
-    if store.get("admin_id") is None:
+    admin_id = get_admin_id(store)
+    if admin_id is None:
         async with STORE_LOCK:
             store = load_store()
-            if store.get("admin_id") is None:
+            if get_admin_id(store) is None:
                 store["admin_id"] = user.id
                 save_store(store)
         await update.message.reply_text(
@@ -176,7 +195,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/pending — စောင့်နေတဲ့ တောင်းဆိုမှုတွေ"
         )
         return
-    if user.id != store.get("admin_id"):
+    if user.id != admin_id:
         await update.message.reply_text(
             "ဒီ bot က Bumblebee app ရဲ့ approval အတွက်ပါ — admin ပဲ သုံးလို့ရတယ်။"
         )
@@ -192,10 +211,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _is_admin(update):
     store = load_store()
+    admin_id = get_admin_id(store)
     return (
-        store.get("admin_id") is not None
+        admin_id is not None
         and update.effective_user is not None
-        and update.effective_user.id == store["admin_id"]
+        and update.effective_user.id == admin_id
     )
 
 
@@ -298,7 +318,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dev["status"] = "approved"
             dev["updated"] = now_iso()
             save_store(store)
-
             await query.edit_message_text(
                 "✅ %s ကို approve ပေးပြီးပြီ — အဲ့ device က သုံးလို့ရပြီ။"
                 % dev["code"]
@@ -379,7 +398,6 @@ def create_web_app(app, token):
     async def handle_status(request):
         """App က status စစ်တာ: ?device_id=..."""
         device_id = (request.query.get("device_id") or "").strip()
-
         if not device_id:
             return web.json_response(
                 {"status": "error", "error": "device_id required"},
