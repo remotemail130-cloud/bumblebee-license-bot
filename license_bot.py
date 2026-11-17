@@ -24,21 +24,36 @@ Telegram commands (admin only — ADMIN_ID env var သတ်မှတ်ထာ�
   /pending                      -> စောင့်နေတဲ့ တောင်းဆိုမှုတွေကြည့်
   Approve / Reject ခလုတ်တွေကနေ တိုက်ရိုက် လုပ်လို့လည်း ရတယ်။
 
-Storage: licenses.json (server ပေါ်က ဖိုင်)။
-သတိပြု: Render free plan မှာ disk က ephemeral ဖြစ်တယ် — redeploy / restart
-ဖြစ်ရင် licenses.json ပျောက်ပြီး approval တွေ ပြန်တောင်းရမယ်။ ဒါကြောင့်
-approve လုပ်ထားတဲ့ device code တွေကို Telegram စာထဲမှာ မှတ်ထားပါ။
+Storage: licenses.json — local ဖိုင် + GitHub (persistent)။
+Render free plan မှာ disk က ephemeral ဖြစ်တယ် — redeploy / restart /
+sleep ဖြစ်ရင် local licenses.json ပျောက်တယ်။ ဒါကြောင့် GitHub repo ထဲ
+သိမ်းတယ် (Contents API, stdlib urllib ပဲ သုံးတယ်):
+  GITHUB_TOKEN  — GitHub fine-grained PAT (Contents: read + write)
+  GITHUB_REPO   — ဥပမာ remotemail130-cloud/bumblebee-licenses
+  GITHUB_PATH   — ဖိုင်လမ်းကြောင်း (ပုံသေ licenses.json)
+  GITHUB_BRANCH — branch (ပုံသေ main)
+ပုံစံ: load လုပ်တဲ့အခါ local ဖိုင် အရင်ကြည့် (ရှိရင် အဲ့ဒါ သုံး)၊
+မရှိရင် GitHub ကနေ ယူပြီး local ပြန်သိမ်း။ save လုပ်တဲ့အခါ local +
+GitHub နှစ်ခုလုံး ရေး။ GitHub မသတ်မှတ်ထားရင် (သို့) ဆက်သွယ်လို့မရရင်
+local ဖိုင်ပဲ သုံးတယ် (ဟောင်း ပုံစံအတိုင်း) — GitHub error ကြောင့်
+bot ဘယ်တော့မှ မကျဘူး။ သတိပြု: GitHub PUT ပျက်ရင် (Render log မှာ
+warning ပါတယ်) အဲ့ ပြောင်းလဲမှုက GitHub မှာ မရောက်ဘူး — နောက်
+restart မှာ အဲ့ ပြောင်းလဲမှု ပြန်မရနိုင်ဘူး။
 
 Checker bot (voucher lookup + KBZPay PDF) နဲ့ လုံးဝ သီးခြား — code, repo,
 Render service, bot token အကုန် သပ်သပ်။
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
 import os
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -66,6 +81,16 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 # restart / redeploy ဖြစ်လည်း မပြောင်းဘူး။ မသတ်မှတ်ထားရင် /start ပို့တဲ့
 # ပထမလူက admin (ဟောင်း ပုံစံ၊ licenses.json ထဲ သိမ်း)။
 ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
+
+# GitHub persistence — Render free disk က ephemeral မို့ approval တွေ
+# restart / sleep တိုင်း မပျောက်အောင် licenses.json ကို GitHub repo ထဲ
+# သိမ်းတယ် (Contents API, stdlib urllib ပဲ သုံးတယ်)။
+# GITHUB_TOKEN မသတ်မှတ်ထားရင် local ဖိုင်ပဲ သုံးတယ် (ဟောင်း ပုံစံအတိုင်း)။
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
+GITHUB_PATH = os.environ.get("GITHUB_PATH", "licenses.json").strip() or "licenses.json"
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip() or "main"
+GITHUB_TIMEOUT = 10  # စက္ကန့် — GitHub API call တစ်ခုအတွက်
 
 # Device code အတွက် အက္ခရာများ — ရောထွေးလွယ်တာတွေ (0/O, 1/I/L) မပါဘူး
 _CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
@@ -101,23 +126,149 @@ def _empty_store():
     return {"admin_id": None, "devices": {}}
 
 
-def load_store():
+# ------------------------------------------------------- GitHub persistence
+# load_store / save_store ထဲက GitHub အပိုင်းက sync (urllib) ဖြစ်တယ် —
+# GitHub ကို ခေါ်တာ ရှားတယ် (local ဖိုင် ပျောက်မှ load, ပြောင်းလဲမှ save)
+# မို့ event loop ကို ကြာကြာ မပိတ်ဘူး။ timeout 10 စက္ကန့် ထားတယ်။
+
+def github_configured():
+    """GitHub persistence ဖွင့်ထားလား — token + repo နှစ်ခုလုံး လိုတယ်။"""
+    return bool(GITHUB_TOKEN and GITHUB_REPO and "/" in GITHUB_REPO)
+
+
+def _github_api_url():
+    repo = "/".join(
+        urllib.parse.quote(part, safe="") for part in GITHUB_REPO.split("/")
+    )
+    path = urllib.parse.quote(GITHUB_PATH, safe="/")
+    return (
+        "https://api.github.com/repos/%s/contents/%s?ref=%s"
+        % (repo, path, urllib.parse.quote(GITHUB_BRANCH, safe=""))
+    )
+
+
+def _github_headers():
+    return {
+        "Authorization": "Bearer " + GITHUB_TOKEN,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "bumblebee-license-bot",
+    }
+
+
+def _github_get_file():
+    """GitHub က licenses.json ကို ယူ — (store_dict, sha) ပြန်တယ်။
+    ဖိုင် မရှိရင် (404) (None, None)။ error ဖြစ်ရင်လည်း (None, None)
+    (log ရေးပြီး local/empty ကို fallback လုပ်)။"""
+    if not github_configured():
+        return None, None
+    try:
+        req = urllib.request.Request(
+            _github_api_url(), method="GET", headers=_github_headers()
+        )
+        with urllib.request.urlopen(req, timeout=GITHUB_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        content = data.get("content") or ""
+        raw = base64.b64decode("".join(content.split())).decode("utf-8")
+        store = json.loads(raw)
+        if not isinstance(store, dict) or "devices" not in store:
+            log.warning("GitHub က licenses.json ပုံစံ မမှန်ဘူး")
+            return None, None
+        store.setdefault("admin_id", None)
+        return store, data.get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            log.info("GitHub မှာ licenses.json မရှိသေးဘူး (404)")
+        else:
+            log.warning("GitHub GET မရဘူး (HTTP %s)", e.code)
+        return None, None
+    except Exception as e:
+        log.warning("GitHub GET မရဘူး: %s", e)
+        return None, None
+
+
+def _github_put_file(store):
+    """licenses.json ကို GitHub မှာ သိမ်း — အောင်ရင် True။
+    error ဖြစ်ရင် log ရေးပြီး False ပြန် (local ဖိုင်က fallback)။"""
+    if not github_configured():
+        return False
+    try:
+        payload = json.dumps(store, ensure_ascii=False, indent=2).encode("utf-8")
+        body = {
+            "message": "Update licenses.json",
+            "content": base64.b64encode(payload).decode("ascii"),
+            "branch": GITHUB_BRANCH,
+        }
+        # ရှိပြီးသား ဖိုင်ကို update လုပ်ဖို့ SHA လိုတယ် (404 ဆို အသစ် ဖန်တီး)
+        _, sha = _github_get_file()
+        if sha:
+            body["sha"] = sha
+        req = urllib.request.Request(
+            _github_api_url(),
+            data=json.dumps(body).encode("utf-8"),
+            method="PUT",
+            headers=_github_headers(),
+        )
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=GITHUB_TIMEOUT) as resp:
+            resp.read()
+        log.info("licenses.json ကို GitHub (%s) မှာ သိမ်းပြီးပြီ", GITHUB_REPO)
+        return True
+    except urllib.error.HTTPError as e:
+        log.warning("GitHub PUT မရဘူး (HTTP %s)", e.code)
+        return False
+    except Exception as e:
+        log.warning("GitHub PUT မရဘူး: %s", e)
+        return False
+
+
+def _load_local():
+    """local licenses.json ကို ဖတ် — မရှိရင် / ပုံစံမမှန်ရင် None။"""
     try:
         with open(STORE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict) or "devices" not in data:
-            return _empty_store()
+            return None
         data.setdefault("admin_id", None)
         return data
     except (FileNotFoundError, json.JSONDecodeError):
-        return _empty_store()
+        return None
 
 
-def save_store(store):
+def _save_local(store):
     tmp = STORE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(store, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STORE_PATH)
+
+
+def load_store():
+    """licenses.json ကို ဖတ် — local အရင်၊ မရှိရင် GitHub၊
+    နှစ်ခုလုံး မရရင် အလွတ် store။ GitHub ကနေ ရရင် local ပြန်သိမ်း
+    (နောက် load တွေ မြန်အောင်)။"""
+    local = _load_local()
+    if local is not None:
+        return local
+    if github_configured():
+        store, _sha = _github_get_file()
+        if store is not None:
+            try:
+                _save_local(store)
+            except Exception as e:
+                log.warning(
+                    "GitHub က ရတဲ့ store ကို local မသိမ်းနိုင်ဘူး: %s", e
+                )
+            log.info("licenses.json ကို GitHub (%s) ကနေ ယူပြီးပြီ", GITHUB_REPO)
+            return store
+    return _empty_store()
+
+
+def save_store(store):
+    """licenses.json ကို သိမ်း — local (atomic) + GitHub (ရှိရင်)။
+    GitHub error ဖြစ်ရင် log ရေးပြီး ဆက်သွား (local က fallback)။"""
+    _save_local(store)
+    if github_configured():
+        _github_put_file(store)
 
 
 def find_by_code(store, code):
